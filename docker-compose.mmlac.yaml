@@ -1,0 +1,35 @@
+# Run with
+# GIT_USER="<your name>" GIT_EMAIL="<your email>" docker compose -f docker-compose.mmlac.yaml up -d
+#
+# Exec into the container with: docker compose -f docker-compose.mmlac.yaml exec gascity zsh
+
+services:
+  gascity:
+    build:
+      context: .
+      dockerfile: Dockerfile.mmlac
+    container_name: gascity
+    stdin_open: false
+    tty: false
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
+      - DAC_OVERRIDE
+      - FOWNER
+      - NET_RAW
+    environment:
+      IS_SANDBOX: 1
+      GIT_USER: Markus Lachinger
+      GIT_EMAIL: business@mmlac.com
+    volumes:
+      - /Users/mmlac/gc-sandbox/home:/home/agent
+      - /Users/mmlac/gc-sandbox/gt:/gt
+      - /Users/mmlac/Library/Application Support/Tessera:/Users/mmlac/Library/Application Support/Tessera
+    ports:
+      - "${DASHBOARD_PORT:-8080}:8080"
+    command: sleep infinity

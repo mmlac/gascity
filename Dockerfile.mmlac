@@ -1,0 +1,75 @@
+# Run with
+# docker build -t gascity:latest -f Dockerfile.mmlac .
+#
+# Sandbox image for running Gas City (`gc`) inside a container, modeled on
+# gastown's Dockerfile.mmlac but adapted for the gascity binary, build process,
+# and runtime dependencies (per docs/getting-started/installation.md).
+FROM docker/sandbox-templates:claude-code
+
+ARG GO_VERSION=1.25.6
+# Pinned dependency versions — keep in sync with deps.env.
+ARG DOLT_VERSION=1.86.6
+ARG BD_VERSION=v1.0.3
+
+USER root
+
+# System dependencies. Runtime tools required by Gas City: tmux, jq, git,
+# util-linux (provides flock). Build tools: build-essential, curl, make.
+# Helpful debugging extras (mirroring gastown): ripgrep, zsh, tini, gh,
+# netcat-openbsd, vim, sqlite3.
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    git \
+    jq \
+    sqlite3 \
+    tmux \
+    curl \
+    ripgrep \
+    zsh \
+    tini \
+    gh \
+    netcat-openbsd \
+    vim \
+    util-linux \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
+
+# Install Go from official tarball (apt golang-go is too old).
+RUN ARCH=$(dpkg --print-architecture) && \
+    curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-${ARCH}.tar.gz" | tar -C /usr/local -xz
+ENV PATH="/app/gascity/bin:/usr/local/go/bin:/home/agent/go/bin:${PATH}"
+
+# Install dolt and bd (beads CLI) using the repo's pinned, checksum-verified
+# installers. These match the versions in deps.env and the rest of CI.
+COPY .github/scripts/install-dolt-archive.sh /tmp/install-dolt-archive.sh
+RUN /tmp/install-dolt-archive.sh "${DOLT_VERSION}" \
+    && rm -f /tmp/install-dolt-archive.sh
+
+COPY .github/scripts/install-bd-archive.sh /tmp/install-bd-archive.sh
+RUN /tmp/install-bd-archive.sh "${BD_VERSION}" \
+    && rm -f /tmp/install-bd-archive.sh
+
+# Set up directories.
+RUN mkdir -p /app /gt && chown agent:agent /app /gt
+
+# Environment setup for bash and zsh.
+RUN echo 'export PATH="/app/gascity/bin:$PATH"' >> /etc/profile.d/gascity.sh && \
+    echo 'export PATH="/app/gascity/bin:$PATH"' >> /etc/zsh/zshenv
+RUN echo 'export COLORTERM="truecolor"' >> /etc/profile.d/colorterm.sh && \
+    echo 'export COLORTERM="truecolor"' >> /etc/zsh/zshenv
+RUN echo 'export TERM="xterm-256color"' >> /etc/profile.d/term.sh && \
+    echo 'export TERM="xterm-256color"' >> /etc/zsh/zshenv
+
+USER agent
+
+COPY --chown=agent:agent . /app/gascity
+
+# `make build` produces ./bin/gc — see Makefile build target.
+RUN cd /app/gascity && make build
+
+COPY --chown=agent:agent --chmod=0755 docker-entrypoint.sh /app/docker-entrypoint.sh
+
+WORKDIR /gt
+
+ENTRYPOINT ["tini", "--", "/app/docker-entrypoint.sh"]
+CMD ["sleep", "infinity"]
