@@ -51,7 +51,7 @@ fi
 # Build scrub filter for the issues table.
 SCRUB_FILTER=""
 if [ "$SCRUB" = "true" ]; then
-    SCRUB_FILTER="WHERE type NOT IN ('message', 'event', 'wisp', 'agent') AND title NOT LIKE 'gc:%'"
+    SCRUB_FILTER="WHERE issue_type NOT IN ('message', 'event', 'wisp', 'agent') AND title NOT LIKE 'gc:%'"
 fi
 
 TOTAL_EXPORTED=0
@@ -64,15 +64,20 @@ for DB in $DATABASES; do
     DB_DIR="$ARCHIVE_REPO/$DB"
     mkdir -p "$DB_DIR"
 
-    # Step 1: Export issues table.
-    if ! dolt_sql -r json -q "SELECT * FROM \`$DB\`.issues $SCRUB_FILTER" > "$DB_DIR/issues.jsonl" 2>/dev/null; then
+    # Step 1: Export issues table. `dolt sql -r json` emits a single-line
+    # {"rows":[...]} document; pipe through jq to produce true newline-
+    # delimited JSONL so wc -l, the test-pollution grep, and spike detection
+    # all operate on one record per line.
+    if ! dolt_sql -r json -q "SELECT * FROM \`$DB\`.issues $SCRUB_FILTER" 2>/dev/null \
+            | jq -c '.rows[]' > "$DB_DIR/issues.jsonl" 2>/dev/null; then
         FAILED_DBS="${FAILED_DBS}$DB "
         continue
     fi
 
     # Export supplemental tables (best-effort).
     for TABLE in comments config dependencies labels metadata; do
-        dolt_sql -r json -q "SELECT * FROM \`$DB\`.\`$TABLE\`" > "$DB_DIR/$TABLE.jsonl" 2>/dev/null || true
+        dolt_sql -r json -q "SELECT * FROM \`$DB\`.\`$TABLE\`" 2>/dev/null \
+            | jq -c '.rows[]' > "$DB_DIR/$TABLE.jsonl" 2>/dev/null || true
     done
 
     # Legacy flat file.
@@ -138,7 +143,14 @@ git commit -q -m "backup $(date -u +%Y-%m-%dT%H:%M:%SZ): exported=$EXPORTED_DBS/
     --author="Gas Town Daemon <daemon@gastown.local>" 2>/dev/null || true
 
 PUSH_STATUS="ok"
-if ! git push origin main -q 2>/dev/null; then
+if ! git remote get-url origin >/dev/null 2>&1; then
+    # No remote configured — local archive only. Treat as soft success so we
+    # don't accumulate phantom failures and escalate forever.
+    PUSH_STATUS="skipped (no remote)"
+    if [ -f "$STATE_FILE" ]; then
+        echo '{"consecutive_push_failures": 0}' > "$STATE_FILE"
+    fi
+elif ! git push origin HEAD -q 2>/dev/null; then
     PUSH_STATUS="failed"
 
     # Track consecutive failures.

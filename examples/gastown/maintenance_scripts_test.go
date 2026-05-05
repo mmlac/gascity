@@ -874,6 +874,197 @@ exit 0
 	}
 }
 
+func TestJSONLExportScrubFilterUsesIssueTypeColumn(t *testing.T) {
+	cityDir := t.TempDir()
+	binDir := t.TempDir()
+	stateDir := t.TempDir()
+	doltLog := filepath.Join(t.TempDir(), "dolt-args.log")
+	archiveRepo := filepath.Join(cityDir, "archive")
+
+	writeMaintenanceDoltStub(t, filepath.Join(binDir, "dolt"))
+	writeExecutable(t, filepath.Join(binDir, "gc"), `#!/bin/sh
+exit 0
+`)
+
+	env := map[string]string{
+		"DOLT_ARGS_LOG":              doltLog,
+		"GC_CITY":                    cityDir,
+		"GC_CITY_PATH":               cityDir,
+		"GC_PACK_STATE_DIR":          stateDir,
+		"GC_DOLT_HOST":               "127.0.0.1",
+		"GC_DOLT_PORT":               "3307",
+		"GC_DOLT_USER":               "root",
+		"GC_DOLT_PASSWORD":           "",
+		"GC_JSONL_ARCHIVE_REPO":      archiveRepo,
+		"GC_JSONL_MAX_PUSH_FAILURES": "99",
+		"GIT_CONFIG_GLOBAL":          filepath.Join(t.TempDir(), "gitconfig"),
+		"GIT_CONFIG_NOSYSTEM":        "1",
+		"PATH":                       binDir + string(os.PathListSeparator) + os.Getenv("PATH"),
+	}
+
+	runScript(t, filepath.Join(exampleDir(), "packs", "maintenance", "assets", "scripts", "jsonl-export.sh"), env)
+
+	logData, err := os.ReadFile(doltLog)
+	if err != nil {
+		t.Fatalf("ReadFile(dolt log): %v", err)
+	}
+	log := string(logData)
+	if strings.Contains(log, "WHERE type NOT IN") {
+		t.Fatalf("scrub filter uses bare 'type' column; the issues schema column is 'issue_type', so this fails silently and exports nothing:\n%s", log)
+	}
+	if !strings.Contains(log, "WHERE issue_type NOT IN") {
+		t.Fatalf("scrub filter must reference the issue_type column:\n%s", log)
+	}
+}
+
+func TestJSONLExportSkipsPushWhenNoRemoteConfigured(t *testing.T) {
+	cityDir := t.TempDir()
+	binDir := t.TempDir()
+	stateDir := t.TempDir()
+	doltLog := filepath.Join(t.TempDir(), "dolt-args.log")
+	gcLog := filepath.Join(t.TempDir(), "gc.log")
+	archiveRepo := filepath.Join(cityDir, "archive")
+
+	writeMaintenanceDoltStub(t, filepath.Join(binDir, "dolt"))
+	writeExecutable(t, filepath.Join(binDir, "gc"), `#!/bin/sh
+printf '%s\n' "$*" >> "$GC_CALL_LOG"
+exit 0
+`)
+
+	gitConfig := filepath.Join(t.TempDir(), "gitconfig")
+	if err := os.WriteFile(gitConfig, []byte("[user]\n\tname = Test\n\temail = test@example.local\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile gitconfig: %v", err)
+	}
+
+	env := map[string]string{
+		"DOLT_ARGS_LOG":              doltLog,
+		"GC_CALL_LOG":                gcLog,
+		"GC_CITY":                    cityDir,
+		"GC_CITY_PATH":               cityDir,
+		"GC_PACK_STATE_DIR":          stateDir,
+		"GC_DOLT_HOST":               "127.0.0.1",
+		"GC_DOLT_PORT":               "3307",
+		"GC_DOLT_USER":               "root",
+		"GC_DOLT_PASSWORD":           "",
+		"GC_JSONL_ARCHIVE_REPO":      archiveRepo,
+		"GC_JSONL_MAX_PUSH_FAILURES": "3",
+		"GIT_CONFIG_GLOBAL":          gitConfig,
+		"GIT_CONFIG_NOSYSTEM":        "1",
+		"PATH":                       binDir + string(os.PathListSeparator) + os.Getenv("PATH"),
+	}
+
+	cmd := exec.Command(filepath.Join(exampleDir(), "packs", "maintenance", "assets", "scripts", "jsonl-export.sh"))
+	cmd.Env = mergeTestEnv(env)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("script failed: %v\n%s", err, out)
+	}
+
+	output := string(out)
+	if !strings.Contains(output, "push: skipped (no remote)") {
+		t.Fatalf("expected push status %q when no origin remote is configured:\n%s", "skipped (no remote)", output)
+	}
+	if strings.Contains(output, "push: failed") {
+		t.Fatalf("push must not be reported as failed when no remote is configured:\n%s", output)
+	}
+
+	stateFile := filepath.Join(stateDir, "jsonl-export-state.json")
+	if data, err := os.ReadFile(stateFile); err == nil {
+		var state map[string]json.RawMessage
+		if err := json.Unmarshal(data, &state); err != nil {
+			t.Fatalf("Unmarshal(state file): %v\n%s", err, data)
+		}
+		if raw, ok := state["consecutive_push_failures"]; ok {
+			var n int
+			if err := json.Unmarshal(raw, &n); err != nil {
+				t.Fatalf("Unmarshal(consecutive_push_failures): %v\n%s", err, raw)
+			}
+			if n != 0 {
+				t.Fatalf("consecutive_push_failures = %d after no-remote skip, want 0", n)
+			}
+		}
+	}
+
+	if data, err := os.ReadFile(gcLog); err == nil {
+		if strings.Contains(string(data), "ESCALATION: JSONL push failed") {
+			t.Fatalf("escalation must not be sent when push is skipped due to missing remote:\n%s", data)
+		}
+	}
+}
+
+func TestJSONLExportProducesNewlineDelimitedJSONL(t *testing.T) {
+	cityDir := t.TempDir()
+	binDir := t.TempDir()
+	stateDir := t.TempDir()
+	archiveRepo := filepath.Join(cityDir, "archive")
+
+	// `dolt sql -r json` returns a single-line {"rows":[...]} document, not
+	// newline-delimited records. The export must reshape it to true JSONL so
+	// that wc -l, the test-pollution grep, and spike detection all line up.
+	writeExecutable(t, filepath.Join(binDir, "dolt"), `#!/bin/sh
+case "$*" in
+  *"SHOW DATABASES"*)
+    printf 'Database\nbeads\n'
+    ;;
+  *".issues"*)
+    printf '{"rows":[{"id":"ga-1","title":"alpha"},{"id":"ga-2","title":"beta"},{"id":"ga-3","title":"gamma"}]}\n'
+    ;;
+  *)
+    printf '{"rows":[]}\n'
+    ;;
+esac
+exit 0
+`)
+	writeExecutable(t, filepath.Join(binDir, "gc"), `#!/bin/sh
+exit 0
+`)
+
+	env := map[string]string{
+		"GC_CITY":                    cityDir,
+		"GC_CITY_PATH":               cityDir,
+		"GC_PACK_STATE_DIR":          stateDir,
+		"GC_DOLT_HOST":               "127.0.0.1",
+		"GC_DOLT_PORT":               "3307",
+		"GC_DOLT_USER":               "root",
+		"GC_DOLT_PASSWORD":           "",
+		"GC_JSONL_ARCHIVE_REPO":      archiveRepo,
+		"GC_JSONL_MAX_PUSH_FAILURES": "99",
+		"GIT_CONFIG_GLOBAL":          filepath.Join(t.TempDir(), "gitconfig"),
+		"GIT_CONFIG_NOSYSTEM":        "1",
+		"PATH":                       binDir + string(os.PathListSeparator) + os.Getenv("PATH"),
+	}
+
+	runScript(t, filepath.Join(exampleDir(), "packs", "maintenance", "assets", "scripts", "jsonl-export.sh"), env)
+
+	issuesFile := filepath.Join(archiveRepo, "beads", "issues.jsonl")
+	data, err := os.ReadFile(issuesFile)
+	if err != nil {
+		t.Fatalf("ReadFile(issues.jsonl): %v", err)
+	}
+
+	if len(data) == 0 {
+		t.Fatalf("issues.jsonl is empty; expected one record per line")
+	}
+	if strings.HasPrefix(string(data), `{"rows":`) {
+		t.Fatalf("issues.jsonl still contains the {\"rows\":...} envelope; output must be newline-delimited records:\n%s", data)
+	}
+
+	lines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("issues.jsonl has %d lines, want 3 (one per record):\n%s", len(lines), data)
+	}
+
+	for i, line := range lines {
+		var rec map[string]any
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Fatalf("line %d not valid JSON: %v\n%s", i+1, err, line)
+		}
+		if rec["id"] == nil {
+			t.Fatalf("line %d missing 'id' field:\n%s", i+1, line)
+		}
+	}
+}
+
 func listenManagedDoltPort(t *testing.T) net.Listener {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -1252,7 +1443,7 @@ case "$*" in
     fi
     ;;
   *"SELECT *"*)
-    printf '{"id":"ga-1","title":"sample"}\n'
+    printf '{"rows":[{"id":"ga-1","title":"sample"}]}\n'
     ;;
   *"COUNT("*)
     printf 'COUNT(*)\n0\n'
