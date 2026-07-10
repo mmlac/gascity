@@ -1,6 +1,37 @@
 package rollout
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/gastownhall/gascity/internal/config"
+)
+
+// TestValueOf covers the render-only generic value accessor, including the
+// binding leg: every registered gate must render a non-empty value, so adding a
+// gate without extending ValueOf is caught here (not silently blank in doctor).
+func TestValueOf(t *testing.T) {
+	t.Parallel()
+	f := ForTest(WithBeadsConditionalWrites(Require), WithFormulaV2(false))
+	if got := f.ValueOf(keyBeadsConditionalWrites); got != "require" {
+		t.Errorf("ValueOf(beads) = %q, want require", got)
+	}
+	if got := f.ValueOf(keyDaemonFormulaV2); got != "false" {
+		t.Errorf("ValueOf(formula_v2) = %q, want false", got)
+	}
+	if got := f.ValueOf("nope.nope"); got != "" {
+		t.Errorf("ValueOf(unknown) = %q, want empty", got)
+	}
+	// binding: every registered gate renders non-empty on a resolved Flags.
+	resolved, err := Resolve(&config.City{}, ResolveOptions{LookupEnv: func(string) (string, bool) { return "", false }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range Specs() {
+		if resolved.ValueOf(s.Key) == "" {
+			t.Errorf("%s: ValueOf returns empty on a resolved Flags — extend ValueOf for this gate", s.Key)
+		}
+	}
+}
 
 // TestNoticesReturnsDefensiveCopy proves a caller cannot mutate a Flags' retained
 // notices through the slice Notices() returns.

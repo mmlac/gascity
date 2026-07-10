@@ -913,3 +913,24 @@ _General-Auto: Stage 5 is the proof that internal/rollout is a general subsystem
 - The two-knob mapping (bd CLI tag vs Go module tag, steveyegge vs gastownhall paths) is recorded in S4-T0 but TestBDVersionPins still does not assert go.mod — the stretch lockstep assertion is unowned; silent CLI/library divergence remains possible until someone adds it.
 - Deferred radar: with scripts/rolloutradar cut to a doctor WARN + manual bead, lifecycle debt visibility depends on operators running doctor and on the FlipDueBy one-bump bound — a long gap between bd bumps stretches the window in which a pending flip can be forgotten without any nightly surfacing.
 - Ambiguity-tolerance ordering in C4 (findExistingAttach before the fence) is comment-and-test enforced, not type-enforced; a future refactor reordering it silently voids the false-loss tolerance — the seam comments and crash-retry test are the only tripwires.
+
+---
+
+## Addendum (2026-07-09): close the raw-config→prompt seam
+
+**Context (from a design review of "flags that involve commands in prompts").** A rollout gate can
+never inject a command into a prompt: `internal/prompt` cannot import `internal/rollout` (import-boundary
+test), and the `PromptContext.Env` value-leak vector is AST-linted to forbid a `rollout.Flags` accessor
+flowing into `Env`. The residual seam: the *raw* config field backing a gate (e.g.
+`cfg.Beads.ConditionalWrites`) is a plain `internal/config` read, so a `cmd/gc` call site could technically
+stuff it into `Env` and a template could branch a command on it — sidestepping `rollout` and re-creating
+the forbidden "flag-gated agent behavior" pattern.
+
+**New task — PR-1a/1d (whichever lands the prompt-boundary AST lint): extend the `Env` lint to
+rollout-gate ConfigPaths.** The set of guarded config paths is enumerable from the registry
+(`rollout.Specs()[].ConfigPath`, e.g. `beads.conditional_writes`, `daemon.formula_v2`). The AST lint that
+forbids `rollout.Flags` accessors → `Env` must ALSO forbid a read of any registered gate's ConfigPath
+field (the Go selector for that toml path) → `Env`. Acceptance: a scratch call site doing
+`ctx.Env["X"] = cfg.Beads.ConditionalWrites` fails the lint naming the file + the gate; a legit non-gate
+config read into `Env` still passes. Rationale: rollout-gate values are Go-transport-only; agent-facing
+command variation belongs in the pack's prompt template + a pinned bd version, not a gate.

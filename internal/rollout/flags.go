@@ -1,5 +1,7 @@
 package rollout
 
+import "strconv"
+
 // resolved pairs a gate's effective value with the layer that produced it.
 type resolved[T any] struct {
 	value  T
@@ -31,6 +33,20 @@ func (f Flags) OriginOf(key string) Origin {
 		return f.beadsConditionalWrites.origin
 	case keyDaemonFormulaV2:
 		return f.formulaV2.origin
+	default:
+		return ""
+	}
+}
+
+// ValueOf returns the resolved value of a registered gate Key in its canonical
+// string spelling ("" for an unknown key). For doctor/status rendering only —
+// production reads use the typed accessors (BeadsConditionalWrites/FormulaV2).
+func (f Flags) ValueOf(key string) string {
+	switch key {
+	case keyBeadsConditionalWrites:
+		return string(f.beadsConditionalWrites.value)
+	case keyDaemonFormulaV2:
+		return strconv.FormatBool(f.formulaV2.value)
 	default:
 		return ""
 	}

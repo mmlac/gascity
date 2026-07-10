@@ -29,6 +29,7 @@ import (
 	"github.com/gastownhall/gascity/internal/orderdiscovery"
 	"github.com/gastownhall/gascity/internal/orderdispatch"
 	"github.com/gastownhall/gascity/internal/orders"
+	"github.com/gastownhall/gascity/internal/rollout"
 	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/supervisor"
@@ -87,6 +88,27 @@ type controllerState struct {
 	// until the loop observes and applies the same or a newer on-disk config.
 	configMutationPending atomic.Bool
 	pendingConfigRev      string
+
+	// rolloutFlags is the boot-latched rollout-gate snapshot: written once in
+	// newControllerState, never reassigned (reads are lock-free by construction,
+	// like version/startedAt). The beads CAS gate is deliberately NOT re-resolved
+	// on reload — a legacy writer racing a CAS writer inside one process is the
+	// corruption it gates — so a divergent on-disk change surfaces as a
+	// pending-restart notice via noteRolloutDrift rather than flipping mid-run.
+	rolloutFlags rollout.Flags
+	// rolloutDriftMu guards rolloutDrift and rolloutDriftSig.
+	rolloutDriftMu sync.Mutex
+	// rolloutDrift holds a NoticePendingRestart when a reloaded config's beads
+	// gate diverges from the boot latch (or resolves invalid); nil when
+	// convergent (level-triggered: a later convergent reload clears it).
+	rolloutDrift *rollout.Notice
+	// rolloutDriftSig is the current drift signature, so noteRolloutDrift logs
+	// one stderr line per transition (into drift, into an invalid on-disk value,
+	// or back in sync) rather than one per reload. "" means in sync.
+	rolloutDriftSig string
+	// rolloutLogf, when non-nil, receives noteRolloutDrift's transition lines
+	// (tests capture it); nil falls back to os.Stderr via rolloutWarnf.
+	rolloutLogf func(format string, args ...any)
 }
 
 var controllerStateInitRigDirIfReady = initDirIfReady
@@ -133,6 +155,14 @@ func newControllerState(
 			beadEventStartSeq = seq
 		}
 	}
+	// Latch the rollout-gate snapshot ONCE from the boot config. A resolve error
+	// (nil cfg or an out-of-enum config value) is warn-and-continue: the zero
+	// Flags is degraded-safe (legacy paths), and this constructor returns no
+	// error — mirroring the best-effort city-store warn below.
+	rolloutFlags, rolloutErr := rollout.Resolve(cfg, rollout.ResolveOptions{})
+	if rolloutErr != nil {
+		fmt.Fprintf(os.Stderr, "api: rollout gates: %v (using zero Flags; legacy paths)\n", rolloutErr)
+	}
 	cs := &controllerState{
 		cfg:               cfg,
 		sp:                sp,
@@ -146,6 +176,7 @@ func newControllerState(
 		startedAt:         time.Now(),
 		adapterReg:        extmsg.NewAdapterRegistry(),
 		beadEventStartSeq: beadEventStartSeq,
+		rolloutFlags:      rolloutFlags,
 	}
 	cs.beadStores = cs.buildStores(cfg)
 	// Capture the initial raw config snapshot so provenance reads before the
@@ -618,6 +649,10 @@ func (cs *controllerState) update(cfg *config.City, sp runtime.Provider) {
 	cs.updateMu.Lock()
 	defer cs.updateMu.Unlock()
 
+	// The beads CAS gate is boot-latched: a reload that would change it only
+	// records a pending-restart notice, it does not flip the process mid-run.
+	cs.noteRolloutDrift(cfg)
+
 	// Build new stores outside the lock (may do file I/O / subprocess spawns).
 	stores := cs.buildStores(cfg)
 	storeSignature := storeMetadataSignature(cs.cityPath, cfg)
@@ -772,6 +807,9 @@ func (cs *controllerState) updateConfigAndProviderOnly(cfg *config.City, sp runt
 	cs.updateMu.Lock()
 	defer cs.updateMu.Unlock()
 
+	// The beads CAS gate is boot-latched (see update).
+	cs.noteRolloutDrift(cfg)
+
 	// Recompute the usage sink so a changed [usage].provider takes effect even on
 	// the store-reuse reload path.
 	usageSink := usageSinkForCity(cfg, cs.cityPath)
@@ -784,6 +822,86 @@ func (cs *controllerState) updateConfigAndProviderOnly(cfg *config.City, sp runt
 	cs.sp = sp
 	cs.usageSink = usageSink
 	cs.mu.Unlock()
+}
+
+// noteRolloutDrift level-compares the effective beads.conditional_writes gate a
+// reloaded config WOULD resolve to against the boot latch and records the
+// divergence for operators. It NEVER re-latches the gate: changing the CAS
+// discipline mid-process is the corruption being gated, so the on-disk change
+// waits for a restart. Three level-triggered states, each logging one line per
+// transition (not per reload):
+//   - in sync: on-disk resolves to the boot value → drift cleared.
+//   - drift: on-disk resolves to a different valid value → NoticePendingRestart
+//     carrying the raw on-disk spelling; a restart would apply it.
+//   - invalid: on-disk fails to resolve (an out-of-enum typo — config.Parse does
+//     NOT enum-validate, internal/rollout does) → NoticePendingRestart noting the
+//     value is invalid, because a restart would warn and fall back to legacy
+//     (Off), so a previously recorded "restart to apply <X>" must not stand.
+func (cs *controllerState) noteRolloutDrift(next *config.City) {
+	boot := cs.rolloutFlags.BeadsConditionalWrites()
+	raw := next.Beads.ConditionalWrites
+
+	var (
+		notice  *rollout.Notice
+		sig     string // drift signature; "" means in sync
+		logLine string
+	)
+	if nextFlags, err := rollout.Resolve(next, rollout.ResolveOptions{}); err != nil {
+		sig = "invalid:" + err.Error()
+		notice = &rollout.Notice{
+			Kind:        rollout.NoticePendingRestart,
+			FlagKey:     rollout.KeyBeadsConditionalWrites,
+			ConfigValue: raw,
+			Message:     fmt.Sprintf("beads.conditional_writes on disk (%q) is invalid (%v); the process stays latched to %q and a restart would fall back to legacy (off)", raw, err, boot),
+		}
+		logLine = fmt.Sprintf("api: rollout: reloaded beads.conditional_writes is invalid (%v); process stays latched to %q, on-disk value will NOT apply on restart\n", err, boot)
+	} else if onDisk := nextFlags.BeadsConditionalWrites(); onDisk != boot {
+		sig = "drift:" + string(onDisk)
+		notice = &rollout.Notice{
+			Kind:        rollout.NoticePendingRestart,
+			FlagKey:     rollout.KeyBeadsConditionalWrites,
+			ConfigValue: raw,
+			Message:     fmt.Sprintf("beads.conditional_writes on disk resolves to %q but the process latched %q at boot; restart to apply", onDisk, boot),
+		}
+		logLine = fmt.Sprintf("api: rollout: beads.conditional_writes on disk resolves to %q but the process is latched to %q; restart to apply\n", onDisk, boot)
+	}
+
+	cs.rolloutDriftMu.Lock()
+	defer cs.rolloutDriftMu.Unlock()
+	prevSig := cs.rolloutDriftSig
+	cs.rolloutDrift = notice
+	cs.rolloutDriftSig = sig
+	if sig == prevSig { // no transition — stay quiet
+		return
+	}
+	if sig == "" {
+		cs.rolloutWarnf("api: rollout: beads.conditional_writes back in sync with the running process (%s)\n", boot)
+		return
+	}
+	cs.rolloutWarnf("%s", logLine)
+}
+
+// rolloutWarnf routes noteRolloutDrift's transition lines to the injected sink
+// (tests) or os.Stderr (production default).
+func (cs *controllerState) rolloutWarnf(format string, args ...any) {
+	if cs.rolloutLogf != nil {
+		cs.rolloutLogf(format, args...)
+		return
+	}
+	fmt.Fprintf(os.Stderr, format, args...)
+}
+
+// RolloutDriftNotices returns the pending-restart notices recorded by reloads
+// (nil when the on-disk config agrees with the boot latch). The S4 status wire
+// merges these with RolloutFlags().Notices(); in PR-1c the stderr transition
+// line is the live operator surface.
+func (cs *controllerState) RolloutDriftNotices() []rollout.Notice {
+	cs.rolloutDriftMu.Lock()
+	defer cs.rolloutDriftMu.Unlock()
+	if cs.rolloutDrift == nil {
+		return nil
+	}
+	return []rollout.Notice{*cs.rolloutDrift}
 }
 
 func (cs *controllerState) runtimeUpdateCanReuseCurrentStores(next *config.City) bool {
@@ -1016,6 +1134,13 @@ func (cs *controllerState) Config() *config.City {
 	defer cs.mu.RUnlock()
 	return cs.cfg
 }
+
+// RolloutFlags returns the boot-latched rollout-gate snapshot (api.RolloutFlagsProvider).
+// Lock-free: rolloutFlags is written once at construction and never reassigned;
+// reloads record drift via noteRolloutDrift rather than re-latching.
+func (cs *controllerState) RolloutFlags() rollout.Flags { return cs.rolloutFlags }
+
+var _ api.RolloutFlagsProvider = (*controllerState)(nil)
 
 // SessionProvider returns the current session provider.
 func (cs *controllerState) SessionProvider() runtime.Provider {

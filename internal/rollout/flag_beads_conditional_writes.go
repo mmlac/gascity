@@ -2,8 +2,14 @@ package rollout
 
 import "github.com/gastownhall/gascity/internal/config"
 
-// keyBeadsConditionalWrites is the registry Key for the beads CAS rollout gate.
-const keyBeadsConditionalWrites = "beads.conditional_writes"
+// KeyBeadsConditionalWrites is the exported registry Key for the beads CAS
+// rollout gate, so composition-root code (cmd/gc, internal/api) can reference
+// the gate without re-hardcoding the dotted string or matching it back out of
+// the registry by a coincidental axis. keyBeadsConditionalWrites is the
+// package-internal spelling used throughout the resolver and registry.
+const KeyBeadsConditionalWrites = "beads.conditional_writes"
+
+const keyBeadsConditionalWrites = KeyBeadsConditionalWrites
 
 // envBeadsConditionalWrites is the single source of truth for this gate's env
 // override name: the registry Spec.EnvOverride, the resolver, and the
