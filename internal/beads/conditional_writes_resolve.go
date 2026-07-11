@@ -55,8 +55,28 @@ type condWritesStamp struct {
 	// deliberate off for tests and future doctor surfaces.
 	condWritesDefaulted bool
 	// condWritesDegradeNoted arms at-most-once degraded-event emission per
-	// store instance (stage 3 wires the emitter; S2b ships the latch unwired).
+	// store instance.
 	condWritesDegradeNoted bool
+	// condWritesOnDegrade is the factory-injected emission callback (nil on
+	// busless paths — bare CLI opens — where the seam diagnostic alone
+	// surfaces the degrade). Invoked at most once per store instance.
+	condWritesOnDegrade func(ConditionalWritesDegrade)
+}
+
+// ConditionalWritesDegrade is the beads-local degrade notification handed to
+// the factory-injected callback. It deliberately mirrors — but does not
+// import — the typed event payload: internal/beads is Layer 0 and never
+// reaches the event bus; the composition root converts this into the
+// registered beads.conditional_writes.degraded payload and attaches what only
+// it knows (store scope, mode origin).
+type ConditionalWritesDegrade struct {
+	// StoreKind names the degraded store type (BdStore, CachingStore, ...).
+	StoreKind string
+	// Mode is the resolved gate mode; "auto" in practice (require refuses
+	// instead of degrading).
+	Mode string
+	// Reason carries the capability veto verbatim.
+	Reason string
 }
 
 // stampConditionalWritesMode records the resolved mode on this store.
@@ -82,11 +102,36 @@ func (s *condWritesStamp) conditionalWritesMode() (gate.Mode, bool) {
 	return s.condWritesModeVal, s.condWritesDefaulted
 }
 
+// setConditionalWritesDegradeCallback installs the factory-injected emission
+// callback. Stamp-time only; nil is valid (log/diagnostic-only paths).
+func (s *condWritesStamp) setConditionalWritesDegradeCallback(cb func(ConditionalWritesDegrade)) {
+	s.condWritesMu.Lock()
+	defer s.condWritesMu.Unlock()
+	s.condWritesOnDegrade = cb
+}
+
+// fireConditionalWritesDegradeOnce invokes the injected callback exactly once
+// per store instance — the first capability degrade — so the
+// beads.conditional_writes.degraded event cannot storm. The callback runs
+// OUTSIDE the stamp mutex (it may reach the event bus or re-enter the store).
+// The seam still returns the diagnostic on EVERY degrade call; only emission
+// is latched.
+func (s *condWritesStamp) fireConditionalWritesDegradeOnce(d ConditionalWritesDegrade) {
+	s.condWritesMu.Lock()
+	if s.condWritesDegradeNoted {
+		s.condWritesMu.Unlock()
+		return
+	}
+	s.condWritesDegradeNoted = true
+	cb := s.condWritesOnDegrade
+	s.condWritesMu.Unlock()
+	if cb != nil {
+		cb(d)
+	}
+}
+
 // noteConditionalDegradeOnce reports true exactly once per store instance —
-// the first capability degrade — so the stage-3 emitter can fire the
-// beads.conditional_writes.degraded event without log storms. The seam does
-// not consult it in S2b (the diagnostic is returned on EVERY degrade call so
-// resolution stays order-independent); it exists for the emission wiring.
+// the same latch fireConditionalWritesDegradeOnce consumes.
 func (s *condWritesStamp) noteConditionalDegradeOnce() bool {
 	s.condWritesMu.Lock()
 	defer s.condWritesMu.Unlock()
@@ -111,6 +156,8 @@ type conditionalWritesModeCarrier interface {
 	stampConditionalWritesMode(mode gate.Mode, defaulted bool) bool
 	conditionalWritesMode() (gate.Mode, bool)
 	noteConditionalDegradeOnce() bool
+	setConditionalWritesDegradeCallback(cb func(ConditionalWritesDegrade))
+	fireConditionalWritesDegradeOnce(d ConditionalWritesDegrade)
 }
 
 // conditionalWriteCapabilityProber is the per-store capability answer for the
@@ -124,6 +171,41 @@ type conditionalWriteCapabilityProber interface {
 	// probeConditionalWriteCapability reports whether conditional writes can
 	// succeed on this store instance, with a human-readable reason when not.
 	probeConditionalWriteCapability() (capable bool, reason string)
+}
+
+// ConditionalWritesResolveTargeter is implemented by store WRAPPERS to
+// declare which inner store ResolveConditionalWriter resolves instead of the
+// wrapper itself. Interface-embedding wrappers (the cmd/gc policy store, the
+// typed class wrappers) block both the unexported mode carrier and the
+// ConditionalWriter assertion, so without this declaration every resolve
+// through them would silently collapse to unset→legacy — under require, the
+// exact silent fallback the seam exists to make inexpressible. The mode
+// itself remains unforgeable: a wrapper can only point resolution at a store,
+// never supply a mode, and only internal/beads types can carry a stamp.
+// Following is bounded (cycle-safe); a nil target terminates on the wrapper.
+type ConditionalWritesResolveTargeter interface {
+	ConditionalWritesResolveTarget() Store
+}
+
+// conditionalWritesMaxResolveDepth bounds resolve-target following so a
+// self-referential wrapper degrades to legacy instead of looping.
+const conditionalWritesMaxResolveDepth = 8
+
+// followConditionalWritesResolveTarget walks wrapper-declared resolution
+// targets to the innermost store the seam should operate on.
+func followConditionalWritesResolveTarget(store Store) Store {
+	for range conditionalWritesMaxResolveDepth {
+		targeter, ok := store.(ConditionalWritesResolveTargeter)
+		if !ok {
+			return store
+		}
+		target := targeter.ConditionalWritesResolveTarget()
+		if target == nil || target == store {
+			return store
+		}
+		store = target
+	}
+	return store
 }
 
 // ConditionalWritesRequiredError reports that the resolved store cannot
@@ -170,13 +252,18 @@ func IsConditionalWritesRequired(err error) bool {
 //	require ∧ incapable               -> (nil, diagnostic, typed refusal):
 //	    fail closed; never fall back to an unconditional write.
 //
-// Like ConditionalWriterFor, the seam does not unwrap store wrappers: a
-// caller holding a typed class wrapper or a cmd/gc policy wrapper must
-// resolve the unwrapped store (interface embedding does not promote the
-// stamp, so a wrapped resolve degrades to unset→legacy).
+// The seam never GUESSES at unwrapping: a wrapper participates only by
+// declaring its resolution target via ConditionalWritesResolveTargeter (the
+// typed class wrappers and the cmd/gc policy wrapper do). A wrapper that
+// declares nothing resolves as unset→legacy, exactly like any other
+// carrier-less store.
 func ResolveConditionalWriter(store Store) (ConditionalWriter, *BeadsDiagnostic, error) {
+	if store != nil {
+		store = followConditionalWritesResolveTarget(store)
+	}
 	mode := gate.ModeUnset
-	if carrier, ok := store.(conditionalWritesModeCarrier); ok {
+	carrier, hasCarrier := store.(conditionalWritesModeCarrier)
+	if hasCarrier {
 		mode, _ = carrier.conditionalWritesMode()
 	}
 	if mode == gate.ModeUnset || mode == gate.Off {
@@ -204,7 +291,21 @@ func ResolveConditionalWriter(store Store) (ConditionalWriter, *BeadsDiagnostic,
 			return refuseOrDegrade(store, mode, "store did not yield a conditional writer")
 		}
 		return writer, nil, nil
-	case gate.DegradeLoud, gate.RefuseClosed:
+	case gate.DegradeLoud:
+		w, diag, degradeErr := refuseOrDegrade(store, mode, reason)
+		if hasCarrier {
+			// Auto-degrade is the state most likely to persist unnoticed;
+			// the factory-injected callback pushes it onto the event bus,
+			// latched once per store instance. Require refusals get no event:
+			// each refusal is a typed error on the failing operation.
+			carrier.fireConditionalWritesDegradeOnce(ConditionalWritesDegrade{
+				StoreKind: diag.Store,
+				Mode:      string(mode),
+				Reason:    reason,
+			})
+		}
+		return w, diag, degradeErr
+	case gate.RefuseClosed:
 		return refuseOrDegrade(store, mode, reason)
 	default: // gate.UseLegacy — unreachable: off/unset short-circuit above.
 		return nil, nil, nil

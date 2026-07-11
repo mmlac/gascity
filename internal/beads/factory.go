@@ -69,6 +69,13 @@ type StoreOpenOptions struct {
 	// (unset) maps to Off with a defaulted marker, so an unthreaded open path
 	// behaves exactly like today's default and can never raise enforcement.
 	ConditionalWrites gate.Mode
+
+	// OnConditionalWritesDegraded receives the first (and only the first)
+	// capability degrade of each store this open produces — the composition
+	// root converts it into the typed beads.conditional_writes.degraded
+	// event wherever a bus exists. Nil on busless paths: the seam's
+	// per-resolve diagnostic remains the only surface there.
+	OnConditionalWritesDegraded func(ConditionalWritesDegrade)
 }
 
 // StoreOpenResult contains the selected Store plus native-selection diagnostics.
@@ -202,6 +209,7 @@ func (opts StoreOpenOptions) stampedResult(result StoreOpenResult, err error) (S
 		}
 		return result, nil
 	}
+	carrier.setConditionalWritesDegradeCallback(opts.OnConditionalWritesDegraded)
 	if !carrier.stampConditionalWritesMode(mode, defaulted) {
 		if opts.Logger != nil {
 			opts.Logger.Debug("conditional_writes stamp skipped",

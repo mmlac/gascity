@@ -570,3 +570,40 @@ func TestOpenStoreAtForCityStampsConditionalWritesMode(t *testing.T) {
 		}
 	})
 }
+
+// TestOpenStoreAtForCityNilPreflightCheckerFallsBackToBd pins the control-
+// plane routing contract: a caller that supplies no PreflightChecker can
+// never be given the native store — the factory treats the missing checker
+// as preflight-unavailable and takes the bd fallback, stamping it like every
+// other path. (The control dispatcher routes its raw bd store through the
+// factory this way; native selection there would be a behavior change.)
+func TestOpenStoreAtForCityNilPreflightCheckerFallsBackToBd(t *testing.T) {
+	t.Setenv(nativeForceFallbackEnv, "")
+	bd := NewMemStore()
+	result, err := OpenStoreAtForCity(context.Background(), StoreOpenOptions{
+		ScopeRoot:         "/city",
+		Provider:          "bd",
+		ConditionalWrites: gate.Require,
+		OpenBdStore:       func() (Store, error) { return bd, nil },
+		OpenNativeStore: func() (Store, error) {
+			t.Fatal("native store must never open without a preflight checker")
+			return nil, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("OpenStoreAtForCity: %v", err)
+	}
+	if result.Store != Store(bd) {
+		t.Fatalf("store = %T, want the bd fallback store", result.Store)
+	}
+	if result.Diagnostic.PreflightGate != "preflight_unavailable" {
+		t.Fatalf("PreflightGate = %q, want preflight_unavailable", result.Diagnostic.PreflightGate)
+	}
+	carrier, ok := result.Store.(conditionalWritesModeCarrier)
+	if !ok {
+		t.Fatal("fallback store carries no stamp")
+	}
+	if mode, _ := carrier.conditionalWritesMode(); mode != gate.Require {
+		t.Fatalf("stamped mode = %q, want require", mode)
+	}
+}

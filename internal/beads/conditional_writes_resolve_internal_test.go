@@ -1,6 +1,7 @@
 package beads
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -391,4 +392,146 @@ func TestConditionalWritesStampConcurrentStampAndResolve(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+// resolveTargetWrapper is a purpose-built wrapper double that declares its
+// resolution target — the beadPolicyStore shape (interface embedding blocks
+// both the unexported carrier and ConditionalWriter promotion, so the wrapper
+// consents to resolution against its inner store instead).
+type resolveTargetWrapper struct {
+	Store
+	target Store
+}
+
+func (w *resolveTargetWrapper) ConditionalWritesResolveTarget() Store { return w.target }
+
+func TestResolveConditionalWriterFollowsDeclaredResolveTarget(t *testing.T) {
+	t.Parallel()
+	t.Run("single wrapper resolves the inner store", func(t *testing.T) {
+		t.Parallel()
+		mem := NewMemStore()
+		mem.stampConditionalWritesMode(gate.Auto, false)
+		w := &resolveTargetWrapper{Store: mem, target: mem}
+		writer, diag, err := ResolveConditionalWriter(w)
+		if err != nil || diag != nil {
+			t.Fatalf("resolve through wrapper = diag %v err %v, want nil/nil", diag, err)
+		}
+		if got, ok := writer.(*MemStore); !ok || got != mem {
+			t.Fatalf("writer = %T, want the INNER stamped store", writer)
+		}
+	})
+	t.Run("nested wrappers follow to the innermost target", func(t *testing.T) {
+		t.Parallel()
+		mem := NewMemStore()
+		mem.DisableConditionalWrites = true
+		mem.stampConditionalWritesMode(gate.Require, false)
+		inner := &resolveTargetWrapper{Store: mem, target: mem}
+		outer := &resolveTargetWrapper{Store: inner, target: inner}
+		_, diag, err := ResolveConditionalWriter(outer)
+		if diag == nil || !IsConditionalWritesRequired(err) {
+			t.Fatalf("nested resolve = (diag %v, err %v), want the inner store's require refusal", diag, err)
+		}
+	})
+	t.Run("class wrappers pass through", func(t *testing.T) {
+		t.Parallel()
+		mem := NewMemStore()
+		mem.stampConditionalWritesMode(gate.Auto, false)
+		writer, diag, err := ResolveConditionalWriter(GraphStore{Store: mem})
+		if err != nil || diag != nil || writer == nil {
+			t.Fatalf("resolve through GraphStore class wrapper = (%v, %v, %v), want the store's writer", writer, diag, err)
+		}
+	})
+	t.Run("self-referential target terminates as legacy", func(t *testing.T) {
+		t.Parallel()
+		w := &resolveTargetWrapper{Store: NewMemStore()}
+		w.target = w
+		writer, diag, err := ResolveConditionalWriter(w)
+		if writer != nil || diag != nil || err != nil {
+			t.Fatalf("cyclic target = (%v, %v, %v), want bounded legacy resolution", writer, diag, err)
+		}
+	})
+	t.Run("nil target terminates on the wrapper", func(t *testing.T) {
+		t.Parallel()
+		w := &resolveTargetWrapper{Store: NewMemStore(), target: nil}
+		writer, diag, err := ResolveConditionalWriter(w)
+		if writer != nil || diag != nil || err != nil {
+			t.Fatalf("nil target = (%v, %v, %v), want legacy (wrapper itself carries no stamp)", writer, diag, err)
+		}
+	})
+}
+
+func TestResolveConditionalWriterDegradeEmissionLatchedOnce(t *testing.T) {
+	t.Parallel()
+	var fired []ConditionalWritesDegrade
+	mem := NewMemStore()
+	mem.DisableConditionalWrites = true
+	mem.stampConditionalWritesMode(gate.Auto, false)
+	mem.setConditionalWritesDegradeCallback(func(d ConditionalWritesDegrade) { fired = append(fired, d) })
+
+	for range 3 {
+		if _, diag, _ := ResolveConditionalWriter(mem); diag == nil {
+			t.Fatal("want degrade diagnostic on every resolve")
+		}
+	}
+	if len(fired) != 1 {
+		t.Fatalf("degrade callback fired %d times over 3 resolves, want exactly 1 (latched per store)", len(fired))
+	}
+	if fired[0].StoreKind != "MemStore" || fired[0].Mode != "auto" || !strings.Contains(fired[0].Reason, "disabled") {
+		t.Fatalf("degrade notification = %+v, want kind/mode/reason populated", fired[0])
+	}
+}
+
+func TestResolveConditionalWriterRequireRefusalDoesNotEmit(t *testing.T) {
+	t.Parallel()
+	var fired int
+	mem := NewMemStore()
+	mem.DisableConditionalWrites = true
+	mem.stampConditionalWritesMode(gate.Require, false)
+	mem.setConditionalWritesDegradeCallback(func(ConditionalWritesDegrade) { fired++ })
+
+	if _, _, err := ResolveConditionalWriter(mem); !IsConditionalWritesRequired(err) {
+		t.Fatal("want typed refusal")
+	}
+	if fired != 0 {
+		t.Fatalf("refusal fired the degrade callback %d times, want 0 (refusals are typed errors, not events)", fired)
+	}
+}
+
+func TestFactoryInjectsDegradeCallback(t *testing.T) {
+	t.Parallel()
+	var fired int
+	mem := NewMemStore()
+	mem.DisableConditionalWrites = true
+	result, err := OpenStoreAtForCity(context.Background(), StoreOpenOptions{
+		ScopeRoot:                   "/city",
+		Provider:                    "file",
+		ConditionalWrites:           gate.Auto,
+		OpenFileStore:               func() (Store, error) { return mem, nil },
+		OnConditionalWritesDegraded: func(ConditionalWritesDegrade) { fired++ },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		_, _, _ = ResolveConditionalWriter(result.Store)
+	}
+	if fired != 1 {
+		t.Fatalf("factory-injected callback fired %d times, want exactly 1", fired)
+	}
+}
+
+func TestCachingStoreForwardsDegradeCallbackToBacking(t *testing.T) {
+	t.Parallel()
+	var fired int
+	mem := NewMemStore()
+	mem.DisableConditionalWrites = true
+	cache := NewCachingStoreForTest(mem, nil)
+	cache.stampConditionalWritesMode(gate.Auto, false)
+	cache.setConditionalWritesDegradeCallback(func(ConditionalWritesDegrade) { fired++ })
+
+	_, _, _ = ResolveConditionalWriter(cache) // degrade via the cache
+	_, _, _ = ResolveConditionalWriter(mem)   // degrade via the backing: SAME latch
+	if fired != 1 {
+		t.Fatalf("callback fired %d times across cache+backing resolves, want 1 (one shared latch)", fired)
+	}
 }

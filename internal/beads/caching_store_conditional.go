@@ -50,11 +50,21 @@ var (
 // ModeUnset, so the seam takes the legacy path — enforcement is never raised
 // through a cache whose backing cannot express the mode.
 
+// conditionalBacking resolves the store the cache's conditional-write
+// machinery should operate on: the raw backing, or — when the backing is a
+// target-declaring wrapper (the cmd/gc policy store in the production
+// CachingStore→policy→store sandwich) — the wrapper's declared resolution
+// target. Without this, a wrapped backing would hide the factory stamp and
+// the cache would silently resolve unset→legacy even under require.
+func (c *CachingStore) conditionalBacking() Store {
+	return followConditionalWritesResolveTarget(c.backing)
+}
+
 // stampConditionalWritesMode forwards the factory stamp to the backing store
 // and reports whether it landed there; false (carrier-less backing) tells the
 // factory the mode was dropped so the miss is logged, never silently believed.
 func (c *CachingStore) stampConditionalWritesMode(mode gate.Mode, defaulted bool) bool {
-	if carrier, ok := c.backing.(conditionalWritesModeCarrier); ok {
+	if carrier, ok := c.conditionalBacking().(conditionalWritesModeCarrier); ok {
 		return carrier.stampConditionalWritesMode(mode, defaulted)
 	}
 	return false
@@ -62,7 +72,7 @@ func (c *CachingStore) stampConditionalWritesMode(mode gate.Mode, defaulted bool
 
 // conditionalWritesMode reads the backing store's stamp.
 func (c *CachingStore) conditionalWritesMode() (gate.Mode, bool) {
-	if carrier, ok := c.backing.(conditionalWritesModeCarrier); ok {
+	if carrier, ok := c.conditionalBacking().(conditionalWritesModeCarrier); ok {
 		return carrier.conditionalWritesMode()
 	}
 	return gate.ModeUnset, false
@@ -71,10 +81,26 @@ func (c *CachingStore) conditionalWritesMode() (gate.Mode, bool) {
 // noteConditionalDegradeOnce shares the backing store's degrade latch: cache
 // and backing are one store instance for emission purposes.
 func (c *CachingStore) noteConditionalDegradeOnce() bool {
-	if carrier, ok := c.backing.(conditionalWritesModeCarrier); ok {
+	if carrier, ok := c.conditionalBacking().(conditionalWritesModeCarrier); ok {
 		return carrier.noteConditionalDegradeOnce()
 	}
 	return false
+}
+
+// setConditionalWritesDegradeCallback forwards the emission callback to the
+// backing store (one latch, one callback, one store instance).
+func (c *CachingStore) setConditionalWritesDegradeCallback(cb func(ConditionalWritesDegrade)) {
+	if carrier, ok := c.conditionalBacking().(conditionalWritesModeCarrier); ok {
+		carrier.setConditionalWritesDegradeCallback(cb)
+	}
+}
+
+// fireConditionalWritesDegradeOnce forwards to the backing store's shared
+// emission latch.
+func (c *CachingStore) fireConditionalWritesDegradeOnce(d ConditionalWritesDegrade) {
+	if carrier, ok := c.conditionalBacking().(conditionalWritesModeCarrier); ok {
+		carrier.fireConditionalWritesDegradeOnce(d)
+	}
 }
 
 // probeConditionalWriteCapability answers with the backing store's capability:
@@ -82,10 +108,10 @@ func (c *CachingStore) noteConditionalDegradeOnce() bool {
 // capability IS the backing's. A backing with CAS verbs but no prober is
 // vacuously capable, mirroring the seam's default.
 func (c *CachingStore) probeConditionalWriteCapability() (bool, string) {
-	if prober, ok := c.backing.(conditionalWriteCapabilityProber); ok {
+	if prober, ok := c.conditionalBacking().(conditionalWriteCapabilityProber); ok {
 		return prober.probeConditionalWriteCapability()
 	}
-	if _, ok := ConditionalWriterFor(c.backing); ok {
+	if _, ok := ConditionalWriterFor(c.conditionalBacking()); ok {
 		return true, ""
 	}
 	return false, "backing store does not implement conditional writes"
@@ -96,7 +122,7 @@ func (c *CachingStore) probeConditionalWriteCapability() (bool, string) {
 // fails or the precondition does. A backing without the capability yields
 // ErrConditionalWriteUnsupported — never an unconditional write.
 func (c *CachingStore) UpdateIfMatch(id string, expectedRevision int64, opts UpdateOpts) error {
-	writer, ok := ConditionalWriterFor(c.backing)
+	writer, ok := ConditionalWriterFor(c.conditionalBacking())
 	if !ok {
 		return ErrConditionalWriteUnsupported
 	}
@@ -123,7 +149,7 @@ func (c *CachingStore) UpdateIfMatch(id string, expectedRevision int64, opts Upd
 // is not suppressed and re-fires bead.closed: fenced paths carry no
 // idempotence short-circuits, and only the backing evaluates the fence.
 func (c *CachingStore) CloseIfMatch(id string, expectedRevision int64) error {
-	writer, ok := ConditionalWriterFor(c.backing)
+	writer, ok := ConditionalWriterFor(c.conditionalBacking())
 	if !ok {
 		return ErrConditionalWriteUnsupported
 	}
@@ -149,7 +175,7 @@ func (c *CachingStore) CloseIfMatch(id string, expectedRevision int64) error {
 // unconditional Delete's full scrub — the one place the deletedSeq stamp is
 // correct, because the bead is actually gone.
 func (c *CachingStore) DeleteIfMatch(id string, expectedRevision int64) error {
-	writer, ok := ConditionalWriterFor(c.backing)
+	writer, ok := ConditionalWriterFor(c.conditionalBacking())
 	if !ok {
 		return ErrConditionalWriteUnsupported
 	}
@@ -184,7 +210,7 @@ func (c *CachingStore) DeleteIfMatch(id string, expectedRevision int64) error {
 // `expected`, and without the evict a cross-process loser re-reads the same
 // stale value through the cache and re-loses until an unrelated reconcile.
 func (c *CachingStore) CompareAndSetMetadataKey(id, key, expected, next string) (bool, error) {
-	writer, ok := ConditionalWriterFor(c.backing)
+	writer, ok := ConditionalWriterFor(c.conditionalBacking())
 	if !ok {
 		return false, ErrConditionalWriteUnsupported
 	}

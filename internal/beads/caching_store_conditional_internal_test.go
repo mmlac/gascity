@@ -1065,3 +1065,41 @@ func TestCachingStoreConditionalCapabilityDelegatesToBacking(t *testing.T) {
 		}
 	})
 }
+
+// TestCachingStoreConditionalFollowsBackingResolveTarget pins the production
+// sandwich CachingStore → target-declaring wrapper → stamped store (the
+// controller wraps the factory store in a policy layer BEFORE caching): the
+// cache's carrier, prober, and verb forwarding must follow the wrapper's
+// declared resolution target or the stamp is hidden and require silently
+// collapses to legacy.
+func TestCachingStoreConditionalFollowsBackingResolveTarget(t *testing.T) {
+	mem := NewMemStore()
+	mem.stampConditionalWritesMode(gate.Require, false)
+	wrapped := &resolveTargetWrapper{Store: mem, target: mem}
+	cache := newConditionalCacheForTest(t, wrapped)
+
+	if mode, _ := cache.conditionalWritesMode(); mode != gate.Require {
+		t.Fatalf("cache mode through wrapped backing = %q, want require", mode)
+	}
+	writer, diag, err := ResolveConditionalWriter(cache)
+	if err != nil || diag != nil {
+		t.Fatalf("resolve = diag %v err %v, want the cache writer", diag, err)
+	}
+	if got, ok := writer.(*CachingStore); !ok || got != cache {
+		t.Fatalf("writer = %T, want the CachingStore itself", writer)
+	}
+
+	// The verbs reach the stamped store through the wrapper too.
+	created, err := cache.Create(Bead{Title: "sandwich"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fresh, err := cache.Get(created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fenced := "fenced"
+	if err := writer.UpdateIfMatch(created.ID, fresh.Revision, UpdateOpts{Title: &fenced}); err != nil {
+		t.Fatalf("UpdateIfMatch through the sandwich: %v", err)
+	}
+}
