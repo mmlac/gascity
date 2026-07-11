@@ -41,8 +41,11 @@ var legacyFlagNeedles = []string{
 // tight ratchet lands with the S5 migration that removes this test. A dir with
 // coupled test files but no ceiling fails loudly.
 var legacyFlagTestFileCeilings = map[string]int{
-	"cmd/gc":              5,
-	"internal/api":        2,
+	"cmd/gc": 5,
+	// internal/api absorbed a third coupled test file (handler_formulas_test.go)
+	// via a mainline merge that predated this freeze; the ceiling blocks growth
+	// beyond that inherited count.
+	"internal/api":        3,
 	"internal/bootstrap":  1,
 	"internal/dispatch":   4,
 	"internal/formula":    5,
