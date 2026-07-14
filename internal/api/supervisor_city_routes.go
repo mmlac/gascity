@@ -200,12 +200,14 @@ func (sm *SupervisorMux) registerCityRoutes() {
 		Path:          "/mail/{id}/reply",
 		Summary:       "Reply to a mail message",
 		DefaultStatus: http.StatusCreated,
-		Errors:        []int{http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound},
+		// 409: a concurrent repeat of the same Idempotency-Key (idempotency-in-flight).
+		Errors: []int{http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound, http.StatusConflict},
 	}, (*Server).humaHandleMailReply)
 	cityDelete(sm, "/mail/{id}", (*Server).humaHandleMailDelete, errorStatuses(http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound))
 
 	// Convoys.
-	cityGet(sm, "/convoys", (*Server).humaHandleConvoyList, errorStatuses(http.StatusNotFound, http.StatusServiceUnavailable))
+	// 400: invalid pagination cursor (invalid-cursor problem type).
+	cityGet(sm, "/convoys", (*Server).humaHandleConvoyList, errorStatuses(http.StatusBadRequest, http.StatusNotFound, http.StatusServiceUnavailable))
 	cityRegister(sm, huma.Operation{
 		OperationID:   "create-convoy",
 		Method:        http.MethodPost,
@@ -230,7 +232,8 @@ func (sm *SupervisorMux) registerCityRoutes() {
 		Path:          "/events",
 		Summary:       "Emit an event",
 		DefaultStatus: http.StatusCreated,
-		Errors:        []int{http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound, http.StatusServiceUnavailable},
+		// 409: a concurrent repeat of the same Idempotency-Key (idempotency-in-flight).
+		Errors: []int{http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound, http.StatusConflict, http.StatusServiceUnavailable},
 	}, (*Server).humaHandleEventEmit)
 	cityRegister(sm, huma.Operation{
 		OperationID: "rotate-events",
@@ -323,7 +326,8 @@ func (sm *SupervisorMux) registerCityRoutes() {
 		DefaultStatus: http.StatusAccepted,
 		Errors:        []int{http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound, http.StatusServiceUnavailable},
 	}, (*Server).humaHandleSessionCreate)
-	cityGet(sm, "/sessions", (*Server).humaHandleSessionList, errorStatuses(http.StatusNotFound, http.StatusServiceUnavailable))
+	// 400: invalid pagination cursor (invalid-cursor problem type).
+	cityGet(sm, "/sessions", (*Server).humaHandleSessionList, errorStatuses(http.StatusBadRequest, http.StatusNotFound, http.StatusServiceUnavailable))
 	cityGet(sm, "/session/{id}", (*Server).humaHandleSessionGet, errorStatuses(http.StatusNotFound, http.StatusConflict, http.StatusServiceUnavailable))
 	cityGet(sm, "/session/{id}/transcript", (*Server).humaHandleSessionTranscript, errorStatuses(http.StatusNotFound, http.StatusConflict, http.StatusServiceUnavailable))
 	cityGet(sm, "/session/{id}/pending", (*Server).humaHandleSessionPending, errorStatuses(http.StatusNotFound, http.StatusConflict, http.StatusServiceUnavailable))
@@ -426,7 +430,8 @@ func (sm *SupervisorMux) registerCityRoutes() {
 		Path:          "/extmsg/adapters",
 		Summary:       "Register an external messaging adapter",
 		DefaultStatus: http.StatusCreated,
-		Errors:        []int{http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound, http.StatusServiceUnavailable},
+		// 409: a concurrent repeat of the same Idempotency-Key (idempotency-in-flight).
+		Errors: []int{http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound, http.StatusConflict, http.StatusServiceUnavailable},
 	}, (*Server).humaHandleExtMsgAdapterRegister)
 	cityDelete(sm, "/extmsg/adapters", (*Server).humaHandleExtMsgAdapterUnregister, errorStatuses(http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound, http.StatusServiceUnavailable))
 }
