@@ -60,6 +60,8 @@ type Server struct {
 	// readOnly; the S2+/S3 handler consumers read it.
 	bootFlags rollout.Flags
 
+	runCensusSource RunCensusSource
+
 	backgroundTasks sync.WaitGroup
 
 	// sessionLogSearchPaths overrides the default search paths for Claude

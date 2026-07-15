@@ -1478,6 +1478,12 @@ export const zRunStepsOutputBody = z.object({
     steps: z.array(zRunStep).nullable()
 });
 
+export const zRunsCensusOutputBody = z.object({
+    partial: z.boolean().optional(),
+    partial_errors: z.array(z.string()).nullish(),
+    status_counts: zRunStatusCounts
+});
+
 export const zRunsListOutputBody = z.object({
     partial: z.boolean().optional(),
     partial_errors: z.array(z.string()).nullish(),
@@ -7055,6 +7061,15 @@ export const zGetV0CityByCityNameRunsQuery = z.object({
  */
 export const zGetV0CityByCityNameRunsResponse = zRunsListOutputBody;
 
+export const zGetV0CityByCityNameRunsCensusPath = z.object({
+    cityName: z.string().min(1).regex(/\S/)
+});
+
+/**
+ * OK
+ */
+export const zGetV0CityByCityNameRunsCensusResponse = zRunsCensusOutputBody;
+
 export const zGetV0CityByCityNameRunsByRunIdPath = z.object({
     cityName: z.string().min(1).regex(/\S/),
     run_id: z.string().min(1).regex(/\S/)
@@ -7479,6 +7494,10 @@ export const zPostV0CityByCityNameUnregisterResponse = zAsyncAcceptedResponse;
 
 export const zGetV0CityByCityNameUsagePath = z.object({
     cityName: z.string().min(1).regex(/\S/)
+});
+
+export const zGetV0CityByCityNameUsageQuery = z.object({
+    aggregate_only: z.boolean().optional()
 });
 
 /**
