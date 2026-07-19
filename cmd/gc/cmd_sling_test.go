@@ -4844,7 +4844,7 @@ provider = "file"
 	if err := os.WriteFile(filepath.Join(cityPath, ".beads", "metadata.json"), []byte(`{"database":"dolt","backend":"dolt","dolt_mode":"server","dolt_database":"gc"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("GC_BEADS", "file")
+	setScopedBeadsProviderForTest(t, "", "file")
 
 	cfg := &config.City{
 		Workspace: config.Workspace{Name: "bright-lights", Prefix: "hq"},
@@ -4875,8 +4875,7 @@ provider = "file"
 }
 
 func TestSlingSourceWorkflowStoreCandidatesUseAuthoritativeProviders(t *testing.T) {
-	t.Setenv("GC_BEADS", "file")
-	t.Setenv("GC_BEADS_SCOPE_ROOT", "")
+	setScopedBeadsProviderForTest(t, "", "file")
 
 	cityPath := t.TempDir()
 	rigPath := filepath.Join(cityPath, "rigs", "local")
@@ -4914,7 +4913,7 @@ func TestSlingSourceWorkflowStoreCandidatesUseAuthoritativeProviders(t *testing.
 		t.Fatalf("rig candidate provider = %q, want bd despite ambient GC_BEADS=file", got)
 	}
 
-	t.Setenv("GC_BEADS", "")
+	setScopedBeadsProviderForTest(t, "", "")
 	remoteCity := t.TempDir()
 	if err := os.WriteFile(filepath.Join(remoteCity, "city.toml"), []byte(`[workspace]
 name = "remote"
